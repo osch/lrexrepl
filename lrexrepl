@@ -1,0 +1,538 @@
+#!/usr/bin/env lua
+
+local VERSION   = "scm"
+local COPYRIGHT = "Copyright (C) 2018 Oliver Schmidt"
+
+local USAGE = [[
+
+USAGE:
+    lrexrepl [OPTIONS] -p <pat> (-r|-l) <repl> [--] [<file1> ...]
+
+    Searches all given files and replaces all pattern matches by using a
+    replace pattern or invoking a given lua script. 
+
+    Options and parameters can appear in any order in the argument list before 
+    the first '--'. Every argument after '--' is considered as file name.
+    
+    If '--' is not specified and no files are given on the commandline, 
+    input file names are read line by line from stdin.
+
+PARAMETERS:
+    -p <pat>  - search pattern: is a regular expression pattern in PCRE
+                syntax.
+
+    -r <repl> - replace pattern: may contain placholder %0 for referencing the
+                matched string, %n for the n-th matched group, n = 1...9.
+
+    -l <repl> - lua script called for each match: The script may return 
+                the substituted string, or nil if no substitution should be 
+                performed for this match. 
+                The following variables are given: 'm' contains a table with 
+                all subpatterns m[0], m[1], ... (named subpatterns are also 
+                supported), variable 'f' contains current file name,
+                variable 'startPos' contains start position of the match, 
+                variable 'endPos' contains end position of the match.
+OPTIONS:
+    Single letter options without arguments can be combined, e.g. -Ri is 
+    equivalent to -R -i.
+    
+    -i        - ignore case
+
+    -M        - disable multi line matching, i.e. '^' matches begin of file and
+                '$' end of file. Without this option '^' matches begin of line 
+                and '$' end of line.
+
+    -s        - dot matches all, i.e. also newlines.
+    
+    -R        - recurse directories (ignores hidden files, i.e. file names 
+                starting with a dot character)
+
+    -b <lua>  - lua script to be called at begin of processing
+                before any file is processed.
+
+    -e <lua>  - lua script to be called at the end of processing
+                after all files have been processed.
+    
+    -f <lua>  - lua script to be called for each file before the
+                file is being processed.
+
+    -a <lua>  - lua script to be called for each file after the
+                file has been processed.
+    
+    -v        - print verbose output
+    -d        - print debug output
+    
+    -h, --help  print usage
+    --version   print version
+]]
+
+local stdin   = io.stdin
+local stdout  = io.stdout
+local stderr  = io.stderr
+local sub     = string.sub
+local format  = string.format
+local unpack  = unpack or table.unpack
+local upper   = string.upper
+local lower   = string.lower
+local concat  = table.concat
+local DIR_SEP = package.config:sub(1,1)
+
+local beginScripts       = {}
+local endScripts         = {}
+local beginOfFileScripts = {}
+local endOfFileScripts   = {}
+local scriptDefs = {
+    { option = "-b", scripts = beginScripts },
+    { option = "-e", scripts = endScripts },
+    { option = "-f", scripts = beginOfFileScripts },
+    { option = "-a", scripts = endOfFileScripts }
+}
+local function scriptOptList(o) 
+    for _, s in ipairs(scriptDefs) do
+        if s.option == o then return s.scripts end
+    end
+end
+local verbose = false
+local isdebug = false
+
+local function charAt(s, i)
+    return sub(s, i, i)
+end
+local function append(t, ...)
+    for i = 1, select("#", ...) do
+        t[#t + 1] = select(i, ...)
+    end
+end
+
+local escapes = { a = "\a", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", v = "\v", ["\\"] = "\\" }
+
+local function unescape(s)
+    s = s:gsub("\\x(%x%x)", function(m)
+        return string.char(tonumber(m, 16))
+    end)
+    s = s:gsub("\\(%d%d?%d?)", function(m)
+        return string.char(tonumber(m))
+    end)
+    if utf8 then
+        s = s:gsub("\\u{(%x+)}", function(m)
+            return utf8.char(tonumber(m, 16))
+        end)
+    end
+    s = s:gsub("\\(.)", function(m)
+        local e = escapes[m]
+        if e then
+            return e
+        else
+            error(format('unknown escape sequence %s', "\\"..m))
+        end
+    end)
+    return s
+end
+
+local function filterOutErrorPrefix(err)
+    return tostring(err):gsub("^[^:]+:%d+:%s*", "")
+end
+
+
+local function load(chunk, chunkname, mode, env)
+    if loadstring and setfenv then
+        local rslt, err = loadstring(chunk, chunkname)
+        if not rslt then return nil, filterOutErrorPrefix(err) end
+        return setfenv(rslt, env)
+    else
+        local rslt, err = _G.load(chunk, chunkname, mode, env)
+        if not rslt then return nil, filterOutErrorPrefix(err) end
+        return rslt
+    end
+end
+
+local function printf(fmt, ...)
+    stdout:write(format(fmt, ...))
+end
+
+local function log(fmt, ...)
+    if verbose then printf(fmt, ...) end
+end
+
+local function logdebug(fmt, ...)
+    if isdebug then printf(fmt, ...) end
+end
+
+local function fail(fmt, ...)
+    error("lrexrepl: "..format(fmt, ...), 2)
+end
+
+local function filterOutFilename(fileName, errorMessage)
+    if errorMessage:sub(1, #fileName) == fileName then
+        errorMessage = errorMessage:sub(#fileName + 1)
+    end
+    return errorMessage:gsub("^%s*:%s*", "")
+end
+
+local function msgh(err)
+    return isdebug and debug.traceback(err, 3) 
+                   or filterOutErrorPrefix(err)
+end
+
+local function pcall(func, ...)
+    local args = { ... }
+    return xpcall(function()
+        return func(unpack(args))
+    end, msgh)
+end
+
+
+local function main(arg)
+
+    local patt, pattArgNo
+    local repl, replArgNo, replFunc
+    local replIsString
+    local fileNames  = {}
+    local fileArgNos = {}
+    local fileNamesFromStdin = true
+    local considerOpts      = true
+    local multiLineMatching = true
+    local opts = ""
+    local recurse      = false
+    local printVersion = false
+    local printHelp    = false
+
+    if #arg ==  0 then
+        verbose   = true
+        printHelp = true
+    end
+    do
+        local i = 0
+        while i < #arg do
+            i = i + 1
+            local a = arg[i]
+            if not considerOpts then
+                fileNames[#fileNames + 1] = a
+                fileArgNos[#fileNames] = i
+                fileNamesFromStdin = false
+            else
+                if charAt(a, 1) == '-' then
+                    if a == '--' then
+                        considerOpts       = false
+                        fileNamesFromStdin = false
+                    elseif a == '--version' then
+                        printVersion = true
+                    elseif a == '--help' then
+                        printHelp = true
+                    elseif a == '-p' then
+                        if patt then
+                            fail('Bad arg #%d: option -p was already given in arg #%d.', i, pattArgNo - 1)
+                        end
+                        if i == #arg then
+                            fail('Bad arg #%d: missing argument for -p.', i)
+                        end
+                        i = i + 1
+                        patt  = arg[i]
+                        pattArgNo = i
+                    elseif a == '-r' then
+                        if replFunc then
+                            fail('Bad arg #%d: -l was specified in arg #%d and cannot be combined with -r.', i, replArgNo - 1)
+                        end
+                        if repl then
+                            fail('Bad arg #%d: option -r was already given in arg #%d.', i, replArgNo - 1)
+                        end
+                        if i == #arg then
+                            fail('Bad arg #%d: missing argument for -r.', i)
+                        end
+                        i = i + 1
+                        repl  = arg[i]
+                        replArgNo = i
+                    elseif a == '-l' then
+                        if repl then
+                            fail('Bad arg #%d: -r was specified in arg #%d and cannot be combined with -l.', i, replArgNo - 1)
+                        end
+                        if replFunc then
+                            fail('Bad arg #%d: option -l was already given in arg #%d.', i, replArgNo - 1)
+                        end
+                        if i == #arg then
+                            fail('Bad arg #%d: missing argument for -l.', i)
+                        end
+                        i = i + 1
+                        replFunc  = arg[i]
+                        replArgNo = i
+                    elseif scriptOptList(a) then
+                        if i == #arg then
+                            fail('Bad arg #%d: missing argument for %s.', i, a)
+                        end
+                        i = i + 1
+                        append(scriptOptList(a), { scriptString = arg[i], scriptArgNo = i })
+                    elseif #a > 1 and charAt(a, 2) ~= '-' then
+                        for j = 2, #a do
+                            local o = charAt(a, j)
+                            if     o == 'i' 
+                                or o == 's' then opts = opts..o
+                            elseif o == 'M' then multiLineMatching = false
+                            elseif o == 'v' then verbose = true
+                            elseif o == 'd' then verbose = true isdebug = true
+                            elseif o == 'R' then recurse = true
+                            elseif o == 'h' then printHelp = true
+                            else
+                                fail('Bad arg #%d: invalid flag %q in option %q', i, o, a)
+                            end
+                        end
+                    else
+                        fail('Bad arg #%d: invalid option %q', i, a)
+                    end
+                else
+                    fileNames[#fileNames + 1] = a
+                    fileArgNos[#fileNames] = i
+                    fileNamesFromStdin = false
+                end
+            end
+        end
+    end
+    if multiLineMatching then
+        opts = opts..'m'
+    end
+    
+    if isdebug or printHelp then
+        printf("lrexrepl %s %s\n", VERSION, COPYRIGHT)
+    end
+    
+    if printHelp then
+        print(USAGE)
+    end
+    
+    if printVersion then
+        print(VERSION)
+    end
+    
+    if #fileNames > 0 or not fileNamesFromStdin or patt or repl or replFunc then
+
+        if not patt then
+            fail('Missing argument "search pattern" (option -p)')
+        end
+        if not repl and not replFunc then
+            fail('Missing argument "replace pattern" (option -r or -l)')
+        end
+        
+        logdebug("Search  %q\n", patt)
+        if repl then
+            logdebug("Replace %q\n", repl)
+        end
+        logdebug("Options %q\n", opts)
+        if fileNamesFromStdin then
+            log("Reading file names from stdin...\n")
+        end
+        
+        local rex = require("rex_pcre")
+        local lfs = require("lfs")
+        
+        local ok, expr = pcall(function()
+            return rex.new(patt, opts)
+        end)
+        
+        if not ok then
+            fail('Bad arg #%d: error in search pattern %q: %s', pattArgNo, patt, expr)
+        end
+
+        local envPreloaded = {
+            printf = printf,
+            format = format,
+            upper  = upper,
+            lower  = lower,
+            
+            capitalize = function(s)
+                if s then return upper(s:sub(1,1))..s:sub(2) end
+            end,
+            uncapitalize = function(s)
+                if s then return lower(s:sub(1,1))..s:sub(2) end
+            end
+        }
+
+        local env = setmetatable({}, { 
+            __index = function(self, key)
+                local value = nil
+                if type(key) == "string" then
+                    pcall(function()
+                        value = require("lrexrepl-extension."..key)
+                    end)
+                end
+                if value == nil then
+                    value = envPreloaded[key]
+                end
+                if value == nil then
+                    value = _G[key]
+                end
+                self[key] = value
+                return value
+            end 
+        })
+        
+        for _, s in ipairs(scriptDefs) do
+            for _, entry in ipairs(s.scripts) do
+                local loaded, err = load(entry.scriptString, format("arg #%d", entry.scriptArgNo), "t", env)
+                if not loaded  then
+                    fail('Bard arg #%d for option %s: argument is invalid Lua script: %s', replArgNo, s.option, err)
+                end
+                entry.script = loaded
+            end
+        end
+        
+        if repl then
+            local ok, err = pcall(function()
+                repl = unescape(repl)
+            end)
+            if not ok then
+                fail('Bad arg #%d: error in replace pattern %q: %s', replArgNo, repl, err)
+            end
+            replIsString = true
+        else
+            local loaded, err = load("return "..replFunc, format("arg #%d", replArgNo), "t", env)
+            if not loaded then
+                loaded, err = load(replFunc, format("arg #%d", replArgNo), "t", env)
+            end
+            if not loaded then
+                fail('Bard arg #%d for option -l: argument is invalid Lua script: %s', replArgNo, err)
+            end
+            repl = loaded
+            replIsString = false
+        end
+        
+        for _, entry in ipairs(beginScripts) do
+            entry.script()
+        end        
+        
+        local fileCount = 0
+        local totalMatchCount = 0
+        local totalSubstCount = 0
+        
+        local function processFile(fileName, argNo)
+            local mode = lfs.attributes(fileName, "mode")
+            if mode == nil then
+                if argNo then
+                    fail("Bad arg #%d: file %q does not exist.", argNo, fileName)
+                end
+            elseif recurse and mode == "directory" then
+                for entry in lfs.dir(fileName) do
+                    if entry:sub(1,1) ~= "." then
+                        processFile(fileName..DIR_SEP..entry)
+                    end
+                end
+            else
+                if mode ~= "file" then
+                    if argNo then
+                        fail("Bad arg #%d: file expected but %q is %s.", argNo, fileName, mode)
+                    end
+                else
+                    log("Processing file %q...\n", fileName)
+                    local inFile, err = io.open(fileName, "r")
+                    if not inFile then
+                        fail("Error reading file %q: %s", fileName, filterOutFilename(fileName, err))
+                    end
+                    local content = inFile:read("*a")
+                    inFile:close()
+                    env.f = fileName
+                    for _, entry in ipairs(beginOfFileScripts) do
+                        entry.script()
+                    end        
+                    local fileChanged = false
+                    local newContent
+                    if not replIsString then
+                        local matchCount = 0
+                        local substCount = 0
+                        local substitutions = {}
+                        do
+                            local pos = 1
+                            local lastEndPos = -1
+                            while true do
+                                local startPos, endPos, match = expr:tfind(content, pos)
+                                if startPos then
+                                    if endPos > lastEndPos then
+                                        matchCount = matchCount + 1
+                                        env.m = match
+                                        env.startPos = startPos
+                                        env.endPos   = endPos
+                                        local matchedContent = content:sub(startPos, endPos)
+                                        match[0] = matchedContent
+                                        local ok, substituted = pcall(repl)
+                                        if not ok then
+                                            fail("Error in substition call (arg #%d): %s", replArgNo, substituted)
+                                        end
+                                        if substituted and substituted ~= matchedContent then
+                                            substCount = substCount + 1
+                                            append(substitutions, {startPos = startPos, endPos = endPos, substituted = substituted})
+                                        end
+                                        lastEndPos = endPos
+                                        pos = endPos + 1
+                                    else
+                                        pos = pos + 1
+                                    end
+                                else
+                                    break
+                                end
+                            end
+                        end
+                        if substCount > 0 then
+                            local buffer = {}
+                            local pos = 1
+                            for _, s in ipairs(substitutions) do
+                                append(buffer, content:sub(pos, s.startPos - 1))
+                                append(buffer, s.substituted)
+                                pos = s.endPos + 1
+                            end
+                            append(buffer, content:sub(pos))
+                            newContent = concat(buffer)
+                            fileChanged = true
+                        end
+                        totalMatchCount = totalMatchCount + matchCount
+                        totalSubstCount = totalSubstCount + substCount
+                    else
+                        local ok, substituted, matchCount, substCount = pcall(rex.gsub, content, expr, repl)
+                        if not ok then
+                            fail("Error in substition call: %s", substituted)
+                        end
+                        if substCount > 0 then
+                            if substituted ~= content then
+                                newContent = substituted
+                                fileChanged = true
+                            else
+                                substCount = 0
+                            end
+                        end
+                        totalMatchCount = totalMatchCount + matchCount
+                        totalSubstCount = totalSubstCount + substCount
+                    end
+                    for _, entry in ipairs(endOfFileScripts) do
+                        entry.script()
+                    end        
+                    if fileChanged then
+                        local outFile, err = io.open(fileName, "w")
+                        if not outFile then
+                            fail("Error writing file %q: %s", fileName, filterOutFilename(fileName, err))
+                        end
+                        outFile:write(newContent)
+                        outFile:close()
+                    end
+                    fileCount = fileCount + 1
+                end
+            end
+        end
+        
+        if fileNamesFromStdin then
+            for fileName in stdin:lines() do
+                processFile(fileName)
+            end
+        else
+            for i, fileName in ipairs(fileNames) do
+                processFile(fileName, fileArgNos[i])
+            end
+        end
+        for _, entry in ipairs(endScripts) do
+            entry.script()
+        end        
+        
+        log("Processed %d file(s) with %d matches and %d substitutions.\n", fileCount, totalMatchCount, totalSubstCount)
+    end
+end
+
+local ok, err = pcall(main, arg)
+if not ok then
+    stderr:write(err.."\n")
+    os.exit(1, true)
+end
