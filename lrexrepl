@@ -1,6 +1,6 @@
 #!/usr/bin/env lua
 
-local VERSION   = "scm"
+local VERSION   = "0.1.0"
 local COPYRIGHT = "Copyright (C) 2018 Oliver Schmidt"
 
 local USAGE = [[
@@ -350,7 +350,7 @@ local function main(arg)
                 local value = nil
                 if type(key) == "string" then
                     pcall(function()
-                        value = require("lrexrepl-extension."..key)
+                        value = require("lrexrepl-extension ."..key)
                     end)
                 end
                 if value == nil then
