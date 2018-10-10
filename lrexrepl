@@ -350,7 +350,7 @@ local function main(arg)
                 local value = nil
                 if type(key) == "string" then
                     pcall(function()
-                        value = require("lrexrepl-extension ."..key)
+                        value = require("lrexrepl-extension."..key)
                     end)
                 end
                 if value == nil then
