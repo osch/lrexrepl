@@ -1,6 +1,6 @@
 #!/usr/bin/env lua
 
-local VERSION   = "0.1.0"
+local VERSION   = "0.1.1"
 local COPYRIGHT = "Copyright (C) 2018 Oliver Schmidt"
 
 local USAGE = [[
