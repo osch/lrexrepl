@@ -368,7 +368,7 @@ local function main(arg)
             for _, entry in ipairs(s.scripts) do
                 local loaded, err = load(entry.scriptString, format("arg #%d", entry.scriptArgNo), "t", env)
                 if not loaded  then
-                    fail('Bard arg #%d for option %s: argument is invalid Lua script: %s', replArgNo, s.option, err)
+                    fail('Bard arg #%d for option %s: argument is invalid Lua script: %s', entry.scriptArgNo, s.option, err)
                 end
                 entry.script = loaded
             end
