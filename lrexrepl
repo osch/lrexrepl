@@ -16,6 +16,10 @@ USAGE:
     
     If '--' is not specified and no files are given on the commandline, 
     input file names are read line by line from stdin.
+    
+    Lua scripts can be given directly on the commandline as arguments for -l, 
+    -b, -e, -f, -a. If one of these script arguments ends with '.lua' it is
+    interpreted as file name containing the lua script to be called.
 
 PARAMETERS:
     -p <pat>  - search pattern: is a regular expression pattern in PCRE
@@ -77,18 +81,14 @@ local lower   = string.lower
 local concat  = table.concat
 local DIR_SEP = package.config:sub(1,1)
 
-local beginScripts       = {}
-local endScripts         = {}
-local beginOfFileScripts = {}
-local endOfFileScripts   = {}
 local scriptDefs = {
-    { option = "-b", scripts = beginScripts },
-    { option = "-e", scripts = endScripts },
-    { option = "-f", scripts = beginOfFileScripts },
-    { option = "-a", scripts = endOfFileScripts }
+    beginScripts       = { option = "-b", scripts = {} },
+    endScripts         = { option = "-e", scripts = {} },
+    beginOfFileScripts = { option = "-f", scripts = {} },
+    endOfFileScripts   = { option = "-a", scripts = {} }
 }
 local function scriptOptList(o) 
-    for _, s in ipairs(scriptDefs) do
+    for _, s in pairs(scriptDefs) do
         if s.option == o then return s.scripts end
     end
 end
@@ -102,6 +102,9 @@ local function append(t, ...)
     for i = 1, select("#", ...) do
         t[#t + 1] = select(i, ...)
     end
+end
+local function endsWith(s, e)
+    return s:sub(#s - #e + 1, #s) == e
 end
 
 local escapes = { a = "\a", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", v = "\v", ["\\"] = "\\" }
@@ -146,6 +149,18 @@ local function load(chunk, chunkname, mode, env)
     end
 end
 
+local function loadfile(filename, mode, env)
+    if setfenv then
+        local rslt, err = loadfile(filename)
+        if not rslt then return nil, err end
+        return setfenv(rslt, env)
+    else
+        local rslt, err = _G.loadfile(filename, mode, env)
+        if not rslt then return nil, err end
+        return rslt
+    end
+end
+
 local function printf(fmt, ...)
     stdout:write(format(fmt, ...))
 end
@@ -170,7 +185,7 @@ local function filterOutFilename(fileName, errorMessage)
 end
 
 local function msgh(err)
-    return isdebug and debug.traceback(err, 3) 
+    return isdebug and debug.traceback(err, 2) 
                    or filterOutErrorPrefix(err)
 end
 
@@ -182,11 +197,33 @@ local function pcall(func, ...)
 end
 
 
+local function scriptcall(isFile, func, ...)
+    local function scriptmsgh(err)
+        return isdebug and debug.traceback(err, 2) 
+            or isFile and err
+            or filterOutErrorPrefix(err)
+    end
+    local args = { ... }
+    return xpcall(function()
+        return func(unpack(args))
+    end, scriptmsgh)
+end
+
+local function callScripts(scriptDef)
+    for _, entry in ipairs(scriptDef.scripts) do
+        local ok, err = scriptcall(entry.fromFile, entry.script)
+        if not ok then
+            fail('Error calling Lua script from arg #%d for option %s: %s', entry.scriptArgNo, scriptDef.option, err)
+        end
+    end
+end
+
 local function main(arg)
 
     local patt, pattArgNo
     local repl, replArgNo, replFunc
     local replIsString
+    local replFromFile = false
     local fileNames  = {}
     local fileArgNos = {}
     local fileNamesFromStdin = true
@@ -364,13 +401,23 @@ local function main(arg)
             end 
         })
         
-        for _, s in ipairs(scriptDefs) do
+        for _, s in pairs(scriptDefs) do
             for _, entry in ipairs(s.scripts) do
-                local loaded, err = load(entry.scriptString, format("arg #%d", entry.scriptArgNo), "t", env)
-                if not loaded  then
-                    fail('Bard arg #%d for option %s: argument is invalid Lua script: %s', entry.scriptArgNo, s.option, err)
+                if endsWith(entry.scriptString, ".lua") then
+                    local fileName = entry.scriptString
+                    local loaded, err = loadfile(fileName, "t", env)
+                    if not loaded  then
+                        fail('Bad arg #%d for option %s: Error loading Lua script from file: %s', entry.scriptArgNo, s.option, err)
+                    end
+                    entry.script = loaded
+                    entry.fromFile = true
+                else
+                    local loaded, err = load(entry.scriptString, format("arg #%d", entry.scriptArgNo), "t", env)
+                    if not loaded  then
+                        fail('Bad arg #%d for option %s: argument is invalid Lua script: %s', entry.scriptArgNo, s.option, err)
+                    end
+                    entry.script = loaded
                 end
-                entry.script = loaded
             end
         end
         
@@ -383,20 +430,28 @@ local function main(arg)
             end
             replIsString = true
         else
-            local loaded, err = load("return "..replFunc, format("arg #%d", replArgNo), "t", env)
-            if not loaded then
-                loaded, err = load(replFunc, format("arg #%d", replArgNo), "t", env)
+            if endsWith(replFunc, ".lua") then
+                local fileName = replFunc
+                local loaded, err = loadfile(fileName, "t", env)
+                if not loaded  then
+                    fail('Bad arg #%d for option -l: Error loading Lua script from file: %s', replArgNo, err)
+                end
+                repl = loaded
+                replFromFile = true
+            else
+                local loaded, err = load("return "..replFunc, format("arg #%d", replArgNo), "t", env)
+                if not loaded then
+                    loaded, err = load(replFunc, format("arg #%d", replArgNo), "t", env)
+                end
+                if not loaded then
+                    fail('Bad arg #%d for option -l: argument is invalid Lua script: %s', replArgNo, err)
+                end
+                repl = loaded
             end
-            if not loaded then
-                fail('Bard arg #%d for option -l: argument is invalid Lua script: %s', replArgNo, err)
-            end
-            repl = loaded
             replIsString = false
         end
-        
-        for _, entry in ipairs(beginScripts) do
-            entry.script()
-        end        
+
+        callScripts(scriptDefs.beginScripts)
         
         local fileCount = 0
         local totalMatchCount = 0
@@ -428,9 +483,9 @@ local function main(arg)
                     local content = inFile:read("*a")
                     inFile:close()
                     env.f = fileName
-                    for _, entry in ipairs(beginOfFileScripts) do
-                        entry.script()
-                    end        
+                    
+                    callScripts(scriptDefs.beginOfFileScripts)
+
                     local fileChanged = false
                     local newContent
                     if not replIsString then
@@ -450,13 +505,18 @@ local function main(arg)
                                         env.endPos   = endPos
                                         local matchedContent = content:sub(startPos, endPos)
                                         match[0] = matchedContent
-                                        local ok, substituted = pcall(repl)
+                                        local ok, substituted = scriptcall(replFromFile, repl)
                                         if not ok then
                                             fail("Error in substition call (arg #%d): %s", replArgNo, substituted)
                                         end
-                                        if substituted and substituted ~= matchedContent then
-                                            substCount = substCount + 1
-                                            append(substitutions, {startPos = startPos, endPos = endPos, substituted = substituted})
+                                        if substituted then
+                                            if type(substituted) ~= "string" and type(substituted) ~= "number" then
+                                                fail("Error in substition call (arg #%d): result is of type %q (string or number expected)", replArgNo, type(substituted))
+                                            end
+                                            if substituted ~= matchedContent then
+                                                substCount = substCount + 1
+                                                append(substitutions, {startPos = startPos, endPos = endPos, substituted = substituted})
+                                            end
                                         end
                                         lastEndPos = endPos
                                         pos = endPos + 1
@@ -498,9 +558,9 @@ local function main(arg)
                         totalMatchCount = totalMatchCount + matchCount
                         totalSubstCount = totalSubstCount + substCount
                     end
-                    for _, entry in ipairs(endOfFileScripts) do
-                        entry.script()
-                    end        
+                    
+                    callScripts(scriptDefs.endOfFileScripts)
+
                     if fileChanged then
                         local outFile, err = io.open(fileName, "w")
                         if not outFile then
@@ -523,15 +583,16 @@ local function main(arg)
                 processFile(fileName, fileArgNos[i])
             end
         end
-        for _, entry in ipairs(endScripts) do
-            entry.script()
-        end        
+        
+        callScripts(scriptDefs.endScripts)
         
         log("Processed %d file(s) with %d matches and %d substitutions.\n", fileCount, totalMatchCount, totalSubstCount)
     end
 end
 
-local ok, err = pcall(main, arg)
+local myargs = arg or {}
+arg = nil
+local ok, err = pcall(main, myargs)
 if not ok then
     stderr:write(err.."\n")
     os.exit(1, true)

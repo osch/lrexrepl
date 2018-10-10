@@ -38,6 +38,13 @@ Replace all `Hello ...` with `Hello ...!` in the given files:
 lrexrepl  -p '(Hello +\w+)' -r '%1!' file1 file2
 ```
 
+Replace all DOS line endings with UNIX line endings in all txt files found by 
+the find command:
+
+```bash
+find -name "*.txt" | lrexrepl  -p '\r\n' -r '\n'
+```
+
 Add 100 to all numbers in the given files:
 
 ```bash
@@ -56,6 +63,13 @@ directory:
 
 ```bash
 lrexrepl  -p '\n' -b 'c=0' -l 'c=c+1' -e 'printf("count=%d\n",c)' -R .
+```
+
+Lua script arguments can also be given as *.lua files:
+
+```bash
+echo "c=0" > foo.lua
+lrexrepl  -p '\n' -b 'foo.lua' -l 'c=c+1' -e 'printf("count=%d\n",c)' -R .
 ```
 
 <!-- ---------------------------------------------------------------------------------------- -->
@@ -81,6 +95,10 @@ USAGE:
     
     If '--' is not specified and no files are given on the commandline, 
     input file names are read line by line from stdin.
+    
+    Lua scripts can be given directly on the commandline as arguments for -l, 
+    -b, -e, -f, -a. If one of these script arguments ends with '.lua' it is
+    interpreted as file name containing the lua script to be called.
 
 PARAMETERS:
     -p <pat>  - search pattern: is a regular expression pattern in PCRE
