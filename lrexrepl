@@ -1,6 +1,6 @@
 #!/usr/bin/env lua
 
-local VERSION   = "0.1.1"
+local VERSION   = "0.2.0"
 local COPYRIGHT = "Copyright (C) 2018 Oliver Schmidt"
 
 local USAGE = [[
@@ -151,7 +151,7 @@ end
 
 local function loadfile(filename, mode, env)
     if setfenv then
-        local rslt, err = loadfile(filename)
+        local rslt, err = _G.loadfile(filename)
         if not rslt then return nil, err end
         return setfenv(rslt, env)
     else
@@ -584,9 +584,9 @@ local function main(arg)
             end
         end
         
-        callScripts(scriptDefs.endScripts)
-        
         log("Processed %d file(s) with %d matches and %d substitutions.\n", fileCount, totalMatchCount, totalSubstCount)
+
+        callScripts(scriptDefs.endScripts)
     end
 end
 
