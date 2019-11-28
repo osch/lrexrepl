@@ -476,7 +476,7 @@ local function main(arg)
                     end
                 else
                     log("Processing file %q...\n", fileName)
-                    local inFile, err = io.open(fileName, "r")
+                    local inFile, err = io.open(fileName, "rb")
                     if not inFile then
                         fail("Error reading file %q: %s", fileName, filterOutFilename(fileName, err))
                     end
@@ -562,7 +562,7 @@ local function main(arg)
                     callScripts(scriptDefs.endOfFileScripts)
 
                     if fileChanged then
-                        local outFile, err = io.open(fileName, "w")
+                        local outFile, err = io.open(fileName, "wb")
                         if not outFile then
                             fail("Error writing file %q: %s", fileName, filterOutFilename(fileName, err))
                         end
