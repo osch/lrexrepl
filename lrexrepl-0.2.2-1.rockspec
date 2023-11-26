@@ -1,6 +1,6 @@
 package = 'lrexrepl'
 
-version = '0.2.1-1'
+version = '0.2.2-1'
 local versionNumber = version:gsub("^(.*)-.-$", "%1")
 
 source = {
