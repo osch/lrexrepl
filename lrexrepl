@@ -1,12 +1,12 @@
 #!/usr/bin/env lua
 
 local VERSION   = "0.2.1"
-local COPYRIGHT = "Copyright (C) 2018-2019 Oliver Schmidt"
+local COPYRIGHT = "Copyright (C) 2018-2023 Oliver Schmidt"
 
 local USAGE = [[
 
 USAGE:
-    lrexrepl [OPTIONS] -p <pat> (-r|-l) <repl> [--] [<file1> ...]
+    lrexrepl [OPTIONS] -p <pat> (-r|-l) <repl> [-] [--] [<file1> ...]
 
     Searches all given files and replaces all pattern matches by using a
     replace pattern or invoking a given lua script. 
@@ -16,6 +16,9 @@ USAGE:
     
     If '--' is not specified and no files are given on the commandline, 
     input file names are read line by line from stdin.
+    
+    If '-' is specified input data from stdin is processed instead of file 
+    content. In this case the processed data is written to stdout.
     
     Lua scripts can be given directly on the commandline as arguments for -l, 
     -b, -e, -f, -a. If one of these script arguments ends with '.lua' it is
@@ -161,8 +164,12 @@ local function loadfile(filename, mode, env)
     end
 end
 
+local function fprintf(out, fmt, ...)
+    out:write(format(fmt, ...))
+end
+
 local function printf(fmt, ...)
-    stdout:write(format(fmt, ...))
+    stderr:write(format(fmt, ...))
 end
 
 local function log(fmt, ...)
@@ -233,6 +240,9 @@ local function main(arg)
     local recurse      = false
     local printVersion = false
     local printHelp    = false
+    local inputFromStdin = false
+    local inputFromStdinArgNo
+    local helpOut = stderr
 
     if #arg ==  0 then
         verbose   = true
@@ -244,6 +254,9 @@ local function main(arg)
             i = i + 1
             local a = arg[i]
             if not considerOpts then
+                if inputFromStdin then
+                    fail('Bad arg #%d: input filename not possible since option "-" was already given in arg #%d.', i, inputFromStdinArgNo)
+                end
                 fileNames[#fileNames + 1] = a
                 fileArgNos[#fileNames] = i
                 fileNamesFromStdin = false
@@ -256,6 +269,7 @@ local function main(arg)
                         printVersion = true
                     elseif a == '--help' then
                         printHelp = true
+                        helpOut = stdout
                     elseif a == '-p' then
                         if patt then
                             fail('Bad arg #%d: option -p was already given in arg #%d.', i, pattArgNo - 1)
@@ -304,18 +318,27 @@ local function main(arg)
                             if     o == 'i' 
                                 or o == 's' then opts = opts..o
                             elseif o == 'M' then multiLineMatching = false
-                            elseif o == 'v' then verbose = true
-                            elseif o == 'd' then verbose = true isdebug = true
-                            elseif o == 'R' then recurse = true
-                            elseif o == 'h' then printHelp = true
+                            elseif o == 'v' then verbose   = true
+                            elseif o == 'd' then verbose   = true  isdebug = true
+                            elseif o == 'R' then recurse   = true
+                            elseif o == 'h' then printHelp = true  helpOut = stdout
                             else
                                 fail('Bad arg #%d: invalid flag %q in option %q', i, o, a)
                             end
                         end
+                    elseif a == '-' then
+                        if #fileNames > 0 then
+                            fail('Bad arg #%d: option "-" not possible since input filename was already given in arg #%d.', i, fileArgNos[1])
+                        end
+                        inputFromStdin = true
+                        inputFromStdinArgNo = i
                     else
                         fail('Bad arg #%d: invalid option %q', i, a)
                     end
                 else
+                    if inputFromStdin then
+                        fail('Bad arg #%d: input filename not possible since option "-" was already given in arg #%d.', i, inputFromStdinArgNo)
+                    end
                     fileNames[#fileNames + 1] = a
                     fileArgNos[#fileNames] = i
                     fileNamesFromStdin = false
@@ -328,15 +351,15 @@ local function main(arg)
     end
     
     if isdebug or printHelp then
-        printf("lrexrepl %s %s\n", VERSION, COPYRIGHT)
+        fprintf(helpOut, "lrexrepl %s %s\n", VERSION, COPYRIGHT)
     end
     
     if printHelp then
-        print(USAGE)
+        fprintf(helpOut, "%s\n", USAGE)
     end
     
     if printVersion then
-        print(VERSION)
+        fprintf(stdout, "%s\n", VERSION)
     end
     
     if #fileNames > 0 or not fileNamesFromStdin or patt or repl or replFunc then
@@ -457,6 +480,93 @@ local function main(arg)
         local totalMatchCount = 0
         local totalSubstCount = 0
         
+
+        local function processContent(content)
+            callScripts(scriptDefs.beginOfFileScripts)
+    
+            local fileChanged = false
+            local newContent
+            if not replIsString then
+                local matchCount = 0
+                local substCount = 0
+                local substitutions = {}
+                do
+                    local pos = 1
+                    local lastEndPos = -1
+                    while true do
+                        local startPos, endPos, match = expr:tfind(content, pos)
+                        if startPos then
+                            if endPos > lastEndPos then
+                                matchCount = matchCount + 1
+                                env.m = match
+                                env.startPos = startPos
+                                env.endPos   = endPos
+                                local matchedContent = content:sub(startPos, endPos)
+                                match[0] = matchedContent
+                                local ok, substituted = scriptcall(replFromFile, repl)
+                                if not ok then
+                                    fail("Error in substition call (arg #%d): %s", replArgNo, substituted)
+                                end
+                                if substituted then
+                                    if type(substituted) ~= "string" and type(substituted) ~= "number" then
+                                        fail("Error in substition call (arg #%d): result is of type %q (string or number expected)", replArgNo, type(substituted))
+                                    end
+                                    if substituted ~= matchedContent then
+                                        substCount = substCount + 1
+                                        append(substitutions, {startPos = startPos, endPos = endPos, substituted = substituted})
+                                    end
+                                end
+                                lastEndPos = endPos
+                                pos = endPos + 1
+                            else
+                                pos = pos + 1
+                            end
+                        else
+                            break
+                        end
+                    end
+                end
+                if substCount > 0 then
+                    local buffer = {}
+                    local pos = 1
+                    for _, s in ipairs(substitutions) do
+                        append(buffer, content:sub(pos, s.startPos - 1))
+                        append(buffer, s.substituted)
+                        pos = s.endPos + 1
+                    end
+                    append(buffer, content:sub(pos))
+                    newContent = concat(buffer)
+                    fileChanged = true
+                end
+                totalMatchCount = totalMatchCount + matchCount
+                totalSubstCount = totalSubstCount + substCount
+            else
+                local ok, substituted, matchCount, substCount = pcall(rex.gsub, content, expr, repl)
+                if not ok then
+                    fail("Error in substition call: %s", substituted)
+                end
+                if substCount > 0 then
+                    if substituted ~= content then
+                        newContent = substituted
+                        fileChanged = true
+                    else
+                        substCount = 0
+                    end
+                end
+                totalMatchCount = totalMatchCount + matchCount
+                totalSubstCount = totalSubstCount + substCount
+            end
+            
+            callScripts(scriptDefs.endOfFileScripts)
+            
+            if fileChanged then
+                return newContent, true
+            else
+                return content, false
+            end
+        end                
+                    
+    
         local function processFile(fileName, argNo)
             local mode = lfs.attributes(fileName, "mode")
             if mode == nil then
@@ -484,89 +594,14 @@ local function main(arg)
                     inFile:close()
                     env.f = fileName
                     
-                    callScripts(scriptDefs.beginOfFileScripts)
-
-                    local fileChanged = false
-                    local newContent
-                    if not replIsString then
-                        local matchCount = 0
-                        local substCount = 0
-                        local substitutions = {}
-                        do
-                            local pos = 1
-                            local lastEndPos = -1
-                            while true do
-                                local startPos, endPos, match = expr:tfind(content, pos)
-                                if startPos then
-                                    if endPos > lastEndPos then
-                                        matchCount = matchCount + 1
-                                        env.m = match
-                                        env.startPos = startPos
-                                        env.endPos   = endPos
-                                        local matchedContent = content:sub(startPos, endPos)
-                                        match[0] = matchedContent
-                                        local ok, substituted = scriptcall(replFromFile, repl)
-                                        if not ok then
-                                            fail("Error in substition call (arg #%d): %s", replArgNo, substituted)
-                                        end
-                                        if substituted then
-                                            if type(substituted) ~= "string" and type(substituted) ~= "number" then
-                                                fail("Error in substition call (arg #%d): result is of type %q (string or number expected)", replArgNo, type(substituted))
-                                            end
-                                            if substituted ~= matchedContent then
-                                                substCount = substCount + 1
-                                                append(substitutions, {startPos = startPos, endPos = endPos, substituted = substituted})
-                                            end
-                                        end
-                                        lastEndPos = endPos
-                                        pos = endPos + 1
-                                    else
-                                        pos = pos + 1
-                                    end
-                                else
-                                    break
-                                end
-                            end
-                        end
-                        if substCount > 0 then
-                            local buffer = {}
-                            local pos = 1
-                            for _, s in ipairs(substitutions) do
-                                append(buffer, content:sub(pos, s.startPos - 1))
-                                append(buffer, s.substituted)
-                                pos = s.endPos + 1
-                            end
-                            append(buffer, content:sub(pos))
-                            newContent = concat(buffer)
-                            fileChanged = true
-                        end
-                        totalMatchCount = totalMatchCount + matchCount
-                        totalSubstCount = totalSubstCount + substCount
-                    else
-                        local ok, substituted, matchCount, substCount = pcall(rex.gsub, content, expr, repl)
-                        if not ok then
-                            fail("Error in substition call: %s", substituted)
-                        end
-                        if substCount > 0 then
-                            if substituted ~= content then
-                                newContent = substituted
-                                fileChanged = true
-                            else
-                                substCount = 0
-                            end
-                        end
-                        totalMatchCount = totalMatchCount + matchCount
-                        totalSubstCount = totalSubstCount + substCount
-                    end
+                    local processedContent, fileChanged = processContent(content)
                     
-                    callScripts(scriptDefs.endOfFileScripts)
-
                     if fileChanged then
                         local outFile, err = io.open(fileName, "wb")
                         if not outFile then
                             fail("Error writing file %q: %s", fileName, filterOutFilename(fileName, err))
                         end
-                        outFile:write(newContent)
+                        outFile:write(processedContent)
                         outFile:close()
                     end
                     fileCount = fileCount + 1
@@ -574,7 +609,11 @@ local function main(arg)
             end
         end
         
-        if fileNamesFromStdin then
+        if inputFromStdin then
+            local content = io.read("*a")
+            local processedContent = processContent(content)
+            io.write(processedContent)
+        elseif fileNamesFromStdin then
             for fileName in stdin:lines() do
                 processFile(fileName)
             end

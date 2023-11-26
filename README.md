@@ -85,7 +85,7 @@ lrexrepl  -p '\n' -b 'foo.lua' -l 'c=c+1' -e 'printf("count=%d\n",c)' -R .
 
 ```
 USAGE:
-    lrexrepl [OPTIONS] -p <pat> (-r|-l) <repl> [--] [<file1> ...]
+    lrexrepl [OPTIONS] -p <pat> (-r|-l) <repl> [-] [--] [<file1> ...]
 
     Searches all given files and replaces all pattern matches by using a
     replace pattern or invoking a given lua script. 
@@ -95,6 +95,9 @@ USAGE:
     
     If '--' is not specified and no files are given on the commandline, 
     input file names are read line by line from stdin.
+    
+    If '-' is specified input data from stdin is processed instead of file 
+    content. In this case the processed data is written to stdout.
     
     Lua scripts can be given directly on the commandline as arguments for -l, 
     -b, -e, -f, -a. If one of these script arguments ends with '.lua' it is
